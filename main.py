@@ -113,66 +113,98 @@ def construct_placeholders(edge_types):
 # (3) Train & test the model.
 ####
 
-val_test_size = 0.05
-n_genes = 500
-n_drugs = 400
-n_drugdrug_rel_types = 3
-gene_net = nx.planted_partition_graph(50, 10, 0.2, 0.05, seed=42)
+print("Loading Decagon dataset...")
 
-gene_adj = nx.adjacency_matrix(gene_net)
+import pandas as pd
+
+data_dir = "data/"
+
+# Load dataset files
+df_combo = pd.read_csv(data_dir + "bio-decagon-combo.csv")
+df_targets = pd.read_csv(data_dir + "bio-decagon-targets.csv")
+df_ppi = pd.read_csv(data_dir + "bio-decagon-ppi.csv")
+
+# Build ID mappings
+genes = set(df_ppi.iloc[:, 0]).union(set(df_ppi.iloc[:, 1]))
+drugs = set(df_targets.iloc[:, 0]).union(set(df_combo.iloc[:, 0])).union(set(df_combo.iloc[:, 1]))
+
+gene2id = {g: i for i, g in enumerate(sorted(genes))}
+drug2id = {d: i for i, d in enumerate(sorted(drugs))}
+
+n_genes = len(gene2id)
+n_drugs = len(drug2id)
+
+# Gene-Gene adjacency
+rows = [gene2id[g] for g in df_ppi.iloc[:, 0]]
+cols = [gene2id[g] for g in df_ppi.iloc[:, 1]]
+
+gene_adj = sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n_genes, n_genes))
+gene_adj = gene_adj + gene_adj.T
+gene_adj[gene_adj > 1] = 1
 gene_degrees = np.array(gene_adj.sum(axis=0)).squeeze()
 
-gene_drug_adj = sp.csr_matrix((10 * np.random.randn(n_genes, n_drugs) > 15).astype(int))
-drug_gene_adj = gene_drug_adj.transpose(copy=True)
+# Gene-Drug adjacency
+rows = [gene2id[g] for g in df_targets.iloc[:, 1]]
+cols = [drug2id[d] for d in df_targets.iloc[:, 0]]
 
-drug_drug_adj_list = []
-tmp = np.dot(drug_gene_adj, gene_drug_adj)
-for i in range(n_drugdrug_rel_types):
-    mat = np.zeros((n_drugs, n_drugs))
-    for d1, d2 in combinations(list(range(n_drugs)), 2):
-        if tmp[d1, d2] == i + 4:
-            mat[d1, d2] = mat[d2, d1] = 1.
-    drug_drug_adj_list.append(sp.csr_matrix(mat))
-drug_degrees_list = [np.array(drug_adj.sum(axis=0)).squeeze() for drug_adj in drug_drug_adj_list]
+gene_drug_adj = sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n_genes, n_drugs))
+drug_gene_adj = gene_drug_adj.transpose()
 
+# Drug-Drug adjacency (multi-edge types)
+edge_types_list = df_combo.iloc[:, 2].unique()
+edge_type_map = {se: i for i, se in enumerate(edge_types_list)}
 
-# data representation
+drug_drug_adj_list = [sp.dok_matrix((n_drugs, n_drugs)) for _ in edge_types_list]
+
+for _, row in df_combo.iterrows():
+    d1 = drug2id[row[0]]
+    d2 = drug2id[row[1]]
+    et = edge_type_map[row[2]]
+    drug_drug_adj_list[et][d1, d2] = 1
+    drug_drug_adj_list[et][d2, d1] = 1
+
+drug_drug_adj_list = [mat.tocsr() for mat in drug_drug_adj_list]
+drug_degrees_list = [np.array(adj.sum(axis=0)).squeeze() for adj in drug_drug_adj_list]
+
+# Assemble Decagon format
 adj_mats_orig = {
     (0, 0): [gene_adj, gene_adj.transpose(copy=True)],
     (0, 1): [gene_drug_adj],
     (1, 0): [drug_gene_adj],
     (1, 1): drug_drug_adj_list + [x.transpose(copy=True) for x in drug_drug_adj_list],
 }
+
 degrees = {
     0: [gene_degrees, gene_degrees],
     1: drug_degrees_list + drug_degrees_list,
 }
 
-# featureless (genes)
+# Features (identity)
 gene_feat = sp.identity(n_genes)
 gene_nonzero_feat, gene_num_feat = gene_feat.shape
 gene_feat = preprocessing.sparse_to_tuple(gene_feat.tocoo())
 
-# features (drugs)
 drug_feat = sp.identity(n_drugs)
 drug_nonzero_feat, drug_num_feat = drug_feat.shape
 drug_feat = preprocessing.sparse_to_tuple(drug_feat.tocoo())
 
-# data representation
 num_feat = {
     0: gene_num_feat,
     1: drug_num_feat,
 }
+
 nonzero_feat = {
     0: gene_nonzero_feat,
     1: drug_nonzero_feat,
 }
+
 feat = {
     0: gene_feat,
     1: drug_feat,
 }
 
 edge_type2dim = {k: [adj.shape for adj in adjs] for k, adjs in adj_mats_orig.items()}
+
 edge_type2decoder = {
     (0, 0): 'bilinear',
     (0, 1): 'bilinear',
@@ -182,8 +214,10 @@ edge_type2decoder = {
 
 edge_types = {k: len(v) for k, v in adj_mats_orig.items()}
 num_edge_types = sum(edge_types.values())
-print("Edge types:", "%d" % num_edge_types)
 
+print("Data loaded!")
+print("Genes:", n_genes)
+print("Drugs:", n_drugs)
 ###########################################################
 #
 # Settings and placeholders
